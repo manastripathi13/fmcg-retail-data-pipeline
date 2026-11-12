@@ -116,6 +116,30 @@ airflow standalone
 
 Unpause `fmcg_daily_pipeline` and Airflow replays the 14 days, about 2 to 3 minutes each. Docker Desktop must be running.
 
+## Query the data with SQL
+
+The `datalake` and `mart` Hive databases can be queried with SQL. Spark SQL reads the table definitions from the Hive metastore and the Parquet files from the `gs://` buckets.
+
+```bash
+./scripts/sql_shell.sh          # interactive prompt (spark-sql>), or: make sql-shell
+```
+
+```sql
+show tables in mart;
+select region, sum(net_sales) as net_sales_inr
+from mart.store_weekly_performance
+where year = 2026 and week = 45
+group by region
+order by net_sales_inr desc;
+```
+
+- **One-off query:** `./scripts/sql_shell.sh -e "select ..."`.
+- **Run a file:** `./scripts/sql_shell.sh -f docs/sample_queries.sql`.
+- **Sample queries:** [`docs/sample_queries.sql`](docs/sample_queries.sql) has ready-made queries covering daily volumes, region and store rankings, category growth, promotion ROI, loyalty tiers, hourly sales and payment mix.
+- **Filter on partition columns:** always include `year`, `month`, `day` (datalake) or `year`, `week` (mart). Spark then reads only the matching GCS folders (partition pruning).
+- **Promotions with `NULL` uplift:** these ran from the first day of the data, so there are no non-promotion days for that brand to compare against yet.
+- **Browsing the raw files:** the emulator's JSON API lists every object, for example `curl "http://localhost:4443/storage/v1/b/fmcg-mart/o?prefix=fact_sales/"`. On real GCP, use the Cloud Console's Storage browser or `gcloud storage ls gs://<bucket>/...`. You can also define BigQuery external tables over the same Parquet folders to query them from BigQuery.
+
 ## Run it without Airflow
 
 ```bash
@@ -228,5 +252,6 @@ scripts/init_metastore.sh            Hive metastore schema (Apache Hive 2.3 scri
 airflow/dags/fmcg_daily_pipeline.py  the daily DAG
 airflow/dags/fmcg_reset.py           wipe local state
 docs/insights/                       generated weekly reports
+docs/sample_queries.sql              ready-to-run SQL over datalake and mart
 tests/                               unit tests (no Spark or GCS needed)
 ```

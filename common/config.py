@@ -44,6 +44,41 @@ def gcs_client():
     return storage.Client(project=GCP_PROJECT)
 
 
+def spark_conf() -> dict[str, str]:
+    """Every Spark setting the jobs use: GCS connector + Hive metastore. Shared with the SQL shell."""
+    jars = [str(j) for j in JARS]
+    conf = {
+        "spark.jars": ",".join(jars),
+        "spark.driver.extraClassPath": ":".join(jars),
+        "spark.driver.memory": "2g",
+        "spark.sql.shuffle.partitions": "8",
+        "spark.sql.session.timeZone": "Asia/Kolkata",
+        "spark.ui.showConsoleProgress": "false",
+        # ---- Hive metastore (table definitions live in Postgres, data lives in GCS) ----
+        "spark.sql.catalogImplementation": "hive",
+        "spark.hadoop.javax.jdo.option.ConnectionURL": METASTORE_JDBC,
+        "spark.hadoop.javax.jdo.option.ConnectionDriverName": "org.postgresql.Driver",
+        "spark.hadoop.javax.jdo.option.ConnectionUserName": os.getenv("METASTORE_USER", "hive"),
+        "spark.hadoop.javax.jdo.option.ConnectionPassword": os.getenv("METASTORE_PASSWORD", "hive"),
+        "spark.hadoop.datanucleus.schema.autoCreateAll": "false",  # schema created once by scripts/init_metastore.sh
+        "spark.hadoop.hive.metastore.schema.verification": "false",
+        "spark.sql.warehouse.dir": f"gs://{DATALAKE_BUCKET}/_warehouse",
+        "spark.sql.hive.convertMetastoreParquet": "true",
+        # ---- GCS connector ----
+        "spark.hadoop.fs.gs.impl": "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFileSystem",
+        "spark.hadoop.fs.AbstractFileSystem.gs.impl": "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFS",
+        "spark.hadoop.fs.gs.project.id": GCP_PROJECT,
+    }
+    if GCS_MODE == "emulator":
+        conf.update({
+            "spark.hadoop.fs.gs.storage.root.url": EMULATOR_URL,
+            "spark.hadoop.fs.gs.auth.service.account.enable": "false",
+            "spark.hadoop.fs.gs.auth.null.enable": "true",
+        })
+    # real mode: connector 2.2 picks up Application Default Credentials automatically
+    return conf
+
+
 def get_spark(app: str):
     """SparkSession with the GCS connector and a Hive metastore (Postgres-backed)."""
     from pyspark.sql import SparkSession
@@ -51,36 +86,9 @@ def get_spark(app: str):
     missing = [str(j) for j in JARS if not j.exists()]
     if missing:
         raise SystemExit(f"missing jars {missing}: run ./scripts/download_jars.sh")
-    jars = ",".join(str(j) for j in JARS)
-    b = (
-        SparkSession.builder.appName(app)
-        .master(os.getenv("SPARK_MASTER", "local[4]"))
-        .config("spark.jars", jars)
-        .config("spark.driver.extraClassPath", ":".join(str(j) for j in JARS))
-        .config("spark.driver.memory", "2g")
-        .config("spark.sql.shuffle.partitions", "8")
-        .config("spark.sql.session.timeZone", "Asia/Kolkata")
-        .config("spark.ui.showConsoleProgress", "false")
-        # ---- Hive metastore (table definitions live in Postgres, data lives in GCS) ----
-        .config("spark.sql.catalogImplementation", "hive")
-        .config("spark.hadoop.javax.jdo.option.ConnectionURL", METASTORE_JDBC)
-        .config("spark.hadoop.javax.jdo.option.ConnectionDriverName", "org.postgresql.Driver")
-        .config("spark.hadoop.javax.jdo.option.ConnectionUserName", os.getenv("METASTORE_USER", "hive"))
-        .config("spark.hadoop.javax.jdo.option.ConnectionPassword", os.getenv("METASTORE_PASSWORD", "hive"))
-        .config("spark.hadoop.datanucleus.schema.autoCreateAll", "false")  # schema created once by scripts/init_metastore.sh
-        .config("spark.hadoop.hive.metastore.schema.verification", "false")
-        .config("spark.sql.warehouse.dir", f"gs://{DATALAKE_BUCKET}/_warehouse")
-        .config("spark.sql.hive.convertMetastoreParquet", "true")
-        # ---- GCS connector ----
-        .config("spark.hadoop.fs.gs.impl", "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFileSystem")
-        .config("spark.hadoop.fs.AbstractFileSystem.gs.impl", "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFS")
-        .config("spark.hadoop.fs.gs.project.id", GCP_PROJECT)
-    )
-    if GCS_MODE == "emulator":
-        b = (b.config("spark.hadoop.fs.gs.storage.root.url", EMULATOR_URL)
-              .config("spark.hadoop.fs.gs.auth.service.account.enable", "false")
-              .config("spark.hadoop.fs.gs.auth.null.enable", "true"))
-    # real mode: connector 2.2 picks up Application Default Credentials automatically
+    b = SparkSession.builder.appName(app).master(os.getenv("SPARK_MASTER", "local[4]"))
+    for k, v in spark_conf().items():
+        b = b.config(k, v)
     spark = b.enableHiveSupport().getOrCreate()
     spark.sparkContext.setLogLevel("ERROR")
     return spark

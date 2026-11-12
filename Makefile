@@ -1,4 +1,4 @@
-.PHONY: setup infra day mart insights run-all sql test reset
+.PHONY: setup infra day mart insights run-all sql sql-shell test reset
 setup:      ## python deps + Spark jars
 	uv sync && ./scripts/download_jars.sh
 infra:      ## GCS emulator, Hive metastore schema, buckets
@@ -13,6 +13,8 @@ insights:   ## weekly report: make insights DATE=2026-11-08
 	uv run python jobs/weekly_insights.py --date $(DATE)
 sql:        ## make sql Q="show partitions mart.fact_sales"
 	uv run python scripts/hive_sql.py "$(Q)"
+sql-shell:  ## interactive SQL prompt over the datalake and mart Hive databases
+	./scripts/sql_shell.sh
 test:
 	uv run pytest -q tests
 reset:      ## wipe emulator buckets + metastore
