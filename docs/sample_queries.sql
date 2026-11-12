@@ -11,11 +11,23 @@ show partitions mart.fact_sales;
 -- Where does a table's data live in GCS, and how is it partitioned?
 describe formatted mart.store_weekly_performance;
 
--- Daily line counts in the raw datalake (one partition per drop date)
-select year, month, day, count(*) as lines, round(sum(quantity * unit_price), 0) as gross_inr
+-- Daily line counts in the raw datalake for November 2026 (one partition per drop date)
+select year, month, day, filename, count(*) as lines, round(sum(quantity * unit_price), 0) as gross_inr
 from datalake.transactions
-group by year, month, day
+where year = 2026 and month = 11
+group by year, month, day, filename
 order by year, month, day;
+
+-- Three years of weekly KPIs with week-on-week and year-on-year change
+select year, week, week_start, stores_trading, net_sales, wow_growth_pct, yoy_growth_pct
+from mart.company_weekly_kpis
+order by year, week;
+
+-- QA: company-level weeks that breached WoW ±20% or YoY ±40%
+select check_name, iso_year, iso_week, round(observed, 1) as change_pct
+from qa.mart_checks
+where level = 'company' and status = 'FAIL'
+order by iso_year, iso_week;
 
 -- Week-on-week net sales by region (Diwali week = 2026-W45)
 select week, region, round(sum(net_sales)) as net_sales_inr, round(sum(prev_week_net_sales)) as prev_week_inr

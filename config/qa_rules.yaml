@@ -1,0 +1,33 @@
+# Data quality rules used by jobs/qa_datalake.py and jobs/qa_mart.py.
+# severity: FAIL stops the next pipeline stage (the Airflow task fails); WARN is recorded and reported.
+
+datalake:
+  primary_keys:                       # must be unique within each daily partition
+    transactions: [transaction_id, line_no]
+    customers: [customer_id]
+    stores: [store_id]
+    promotions: [promotion_id]
+  # raw POS feeds contain re-sent lines (removed in the mart): up to this share is a WARN, above it a FAIL
+  transactions_max_duplicate_pct: 1.0
+  not_null_keys:
+    transactions: [transaction_id, line_no, store_id, sku, transaction_ts]
+    customers: [customer_id]
+    stores: [store_id]
+    promotions: [promotion_id]
+
+mart:
+  primary_keys:                       # must be unique within each weekly partition
+    fact_sales: [transaction_id, line_no]
+    store_weekly_performance: [store_id]
+    category_brand_weekly: [category, sub_category, brand]
+    promotion_weekly_effectiveness: [promotion_id]
+    customer_tier_weekly: [customer_type, loyalty_tier]
+    company_weekly_kpis: []           # exactly one row per week
+  wow_change:
+    threshold_abs_pct: 20             # |week-on-week % change| above this is flagged
+    fail_levels: [company]            # company-level breaches FAIL the check
+    warn_levels: [region, category]   # region/category breaches are WARN
+  yoy_change:
+    threshold_abs_pct: 40             # |year-on-year % change| above this is flagged
+    fail_levels: [company]
+    warn_levels: [region, category]

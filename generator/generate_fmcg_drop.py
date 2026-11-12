@@ -1,19 +1,26 @@
-"""Simulate the FMCG retailer's daily file drop into the landing bucket.
+"""Simulate the FMCG retailer's daily file drop into the landing bucket (3 years of history + daily).
 
 Every business day the retailer's systems export four gzipped CSV files:
 
   gs://<landing>/transactions/YYYY/MM/DD/transactions_YYYYMMDD.csv.gz   POS line items for that day
-  gs://<landing>/customers/YYYY/MM/DD/customers_YYYYMMDD.csv.gz         loyalty members (full on day 1, then new + changed)
-  gs://<landing>/stores/YYYY/MM/DD/stores_YYYYMMDD.csv.gz               full store master snapshot
+  gs://<landing>/customers/YYYY/MM/DD/customers_YYYYMMDD.csv.gz         loyalty members (full on the first day, then new + changed)
+  gs://<landing>/stores/YYYY/MM/DD/stores_YYYYMMDD.csv.gz               full snapshot of stores open that day
   gs://<landing>/promotions/YYYY/MM/DD/promotions_YYYYMMDD.csv.gz       promotions live or announced that day
 
-The data is synthetic but shaped like real Indian FMCG retail: festive demand building to Diwali
-(8 Nov 2026), weekend peaks, promotions that lift units, returns (negative quantity), walk-in
-customers without a loyalty id, and ~0.5% of lines re-sent twice by the POS system.
+History covers the three years up to 13 Nov 2026 (HISTORY_START .. HISTORY_END). Any later date
+can be generated too, which is what the nightly Airflow run does.
+
+The data is synthetic but behaves like Indian FMCG retail over time:
+  - ~9% year-on-year growth plus price inflation of ~5% a year
+  - new stores opening and new loyalty members signing up through the period
+  - festive peaks around Diwali (real dates per year), Holi, New Year, a summer beverages season
+    and a dip in the monsoon; weekend peaks every week
+  - a promotion calendar per year; promotions lift units
+  - returns (negative quantity), walk-ins without a loyalty id, and ~0.5% of POS lines re-sent twice
 
 Usage:
-    python generator/generate_fmcg_drop.py --date 2026-10-26          # one day (what Airflow runs)
-    python generator/generate_fmcg_drop.py --all                      # every day of the simulation
+    python generator/generate_fmcg_drop.py --date 2026-11-13                      # one day (nightly run)
+    python generator/generate_fmcg_drop.py --start 2023-11-14 --end 2026-11-13    # backfill a range
 """
 
 from __future__ import annotations
@@ -25,15 +32,18 @@ import io
 import math
 import random
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common.config import LANDING_BUCKET, gcs_client  # noqa: E402
 
-SIM_START, SIM_END = date(2026, 10, 26), date(2026, 11, 8)   # ISO weeks 44-45 of 2026, ending on Diwali
-DIWALI = date(2026, 11, 8)
+HISTORY_START, HISTORY_END = date(2023, 11, 14), date(2026, 11, 13)   # three years back from 13 Nov 2026
 SEED = 2026
+DIWALI = {2023: date(2023, 11, 12), 2024: date(2024, 11, 1), 2025: date(2025, 10, 21), 2026: date(2026, 11, 8), 2027: date(2027, 10, 29)}
+HOLI = {2024: date(2024, 3, 25), 2025: date(2025, 3, 14), 2026: date(2026, 3, 4), 2027: date(2027, 3, 22)}
 
 REGIONS = {
     "North": [("Delhi", "Delhi"), ("Gurugram", "Haryana"), ("Noida", "Uttar Pradesh"), ("Lucknow", "Uttar Pradesh"), ("Jaipur", "Rajasthan")],
@@ -94,7 +104,16 @@ def products() -> list[dict]:
     return out
 
 
-def build_stores(rng: random.Random) -> list[dict]:
+def price_on(mrp: float, d: date) -> float:
+    """Shelf price on a date: ~5% inflation a year from the start of history, rounded to the rupee."""
+    years = (d - HISTORY_START).days / 365.25
+    return float(round(mrp * 1.05 ** years))
+
+
+@lru_cache(maxsize=1)
+def master_data() -> tuple[list[dict], list[dict], list[dict]]:
+    """Stores, customers and promotions. Identical on every run (fixed seed)."""
+    rng = random.Random(SEED)
     stores, n = [], 0
     for region, cities in REGIONS.items():
         for city, state in cities:
@@ -102,73 +121,113 @@ def build_stores(rng: random.Random) -> list[dict]:
                 n += 1
                 fmt = rng.choices(list(FORMATS), weights=[2, 4, 3, 3])[0]
                 lo, hi, _ = FORMATS[fmt]
+                # most stores pre-date the history; about 1 in 6 opens during it
+                opened = (HISTORY_START + timedelta(days=rng.randint(60, 1000)) if rng.random() < 0.17
+                          else date(2012, 1, 1) + timedelta(days=rng.randint(0, 4000)))
                 stores.append({"store_id": f"ST{n:03d}", "store_name": f"{city} {fmt} {n}", "store_format": fmt,
                                "city": city, "state": state, "region": region,
-                               "opened_date": (date(2012, 1, 1) + timedelta(days=rng.randint(0, 4800))).isoformat(),
-                               "area_sqft": rng.randint(lo, hi)})
-    return stores
-
-
-def build_customers(rng: random.Random, stores: list[dict], n: int = 3000) -> list[dict]:
-    out = []
-    for i in range(1, n + 1):
+                               "opened_date": opened.isoformat(), "area_sqft": rng.randint(lo, hi)})
+    customers = []
+    for i in range(1, 4501):
         home = rng.choice(stores)
-        out.append({"customer_id": f"CU{i:06d}", "customer_name": f"{rng.choice(FIRST)} {rng.choice(LAST)}",
-                    "gender": rng.choice(["F", "M"]), "age_band": rng.choices(["18-24", "25-34", "35-44", "45-54", "55+"], weights=[2, 4, 4, 3, 2])[0],
-                    "city": home["city"], "state": home["state"], "home_store_id": home["store_id"],
-                    "loyalty_tier": rng.choices(["Bronze", "Silver", "Gold", "Platinum"], weights=[50, 30, 15, 5])[0],
-                    "signup_date": (date(2019, 1, 1) + timedelta(days=rng.randint(0, 2490))).isoformat()})
-    return out
+        first_possible = max(date(2019, 1, 1), date.fromisoformat(home["opened_date"]))
+        span = (HISTORY_END - first_possible).days
+        signup = first_possible + timedelta(days=int(span * rng.random() ** 0.8))
+        customers.append({"customer_id": f"CU{i:06d}", "customer_name": f"{rng.choice(FIRST)} {rng.choice(LAST)}",
+                          "gender": rng.choice(["F", "M"]),
+                          "age_band": rng.choices(["18-24", "25-34", "35-44", "45-54", "55+"], weights=[2, 4, 4, 3, 2])[0],
+                          "city": home["city"], "state": home["state"], "home_store_id": home["store_id"],
+                          "loyalty_tier": rng.choices(["Bronze", "Silver", "Gold", "Platinum"], weights=[50, 30, 15, 5])[0],
+                          "signup_date": signup.isoformat()})
+    return stores, customers, build_promotions()
 
 
 def build_promotions() -> list[dict]:
-    p = [
-        ("PR001", "Diwali Sweets Bonanza", "PERCENT_OFF", 20, "Foods", "Mithas", "2026-10-30", "2026-11-08"),
-        ("PR002", "Festive Clean Home", "PERCENT_OFF", 15, "Home Care", "Kleanso", "2026-10-26", "2026-11-08"),
-        ("PR003", "Brightex Wash Week", "FLAT_OFF", 10, "Home Care", "Brightex", "2026-10-26", "2026-11-01"),
-        ("PR004", "Staples Stock-Up", "PERCENT_OFF", 10, "Foods", "Annapurna Gold", "2026-11-02", "2026-11-08"),
-        ("PR005", "Chai Time", "BUY_X_GET_Y", 25, "Beverages", "Chaiwala", "2026-10-29", "2026-11-04"),
-        ("PR006", "Ghee for Diwali", "PERCENT_OFF", 12, "Dairy", "Gaukul", "2026-11-03", "2026-11-08"),
-        ("PR007", "Glow Up Personal Care", "PERCENT_OFF", 18, "Personal Care", "Aurelle", "2026-10-26", "2026-11-02"),
-        ("PR008", "Snack Attack", "BUY_X_GET_Y", 33, "Foods", "Tasteland", "2026-11-05", "2026-11-08"),
-        ("PR009", "Fizzup Party Pack", "FLAT_OFF", 8, "Beverages", "Fizzup", "2026-11-06", "2026-11-08"),
-    ]
-    return [{"promotion_id": a, "promo_name": b, "promo_type": c, "discount_pct": d, "category": e, "brand": f,
-             "start_date": g, "end_date": h} for a, b, c, d, e, f, g, h in p]
+    """A promotion calendar for every year: festive, seasonal and brand-led campaigns."""
+    out = []
+    for y in range(2023, 2028):
+        cal = []
+        if y in DIWALI:
+            dw = DIWALI[y]
+            cal += [
+                ("Diwali Sweets Bonanza", "PERCENT_OFF", 20, "Foods", "Mithas", dw - timedelta(days=9), dw),
+                ("Festive Clean Home", "PERCENT_OFF", 15, "Home Care", "Kleanso", dw - timedelta(days=13), dw),
+                ("Staples Stock-Up", "PERCENT_OFF", 10, "Foods", "Annapurna Gold", dw - timedelta(days=6), dw),
+                ("Ghee for Diwali", "PERCENT_OFF", 12, "Dairy", "Gaukul", dw - timedelta(days=5), dw),
+            ]
+        if y in HOLI:
+            h = HOLI[y]
+            cal += [("Holi Snack Party", "BUY_X_GET_Y", 33, "Foods", "Tasteland", h - timedelta(days=5), h + timedelta(days=1)),
+                    ("Holi Colour Care", "PERCENT_OFF", 15, "Personal Care", "Aurelle", h - timedelta(days=4), h + timedelta(days=3))]
+        cal += [
+            ("Summer Coolers", "FLAT_OFF", 8, "Beverages", "Fizzup", date(y, 4, 15), date(y, 5, 31)),
+            ("Monsoon Chai Time", "BUY_X_GET_Y", 25, "Beverages", "Chaiwala", date(y, 7, 1), date(y, 7, 21)),
+            ("Brightex Wash Week", "FLAT_OFF", 10, "Home Care", "Brightex", date(y, 8, 10), date(y, 8, 16)),
+            ("Glow Up Personal Care", "PERCENT_OFF", 18, "Personal Care", "Aurelle", date(y, 9, 5), date(y, 9, 14)),
+            ("New Year Party Pack", "FLAT_OFF", 8, "Beverages", "Fizzup", date(y, 12, 26), date(y, 12, 31)),
+        ]
+        for i, (name, ptype, pct, cat, brand, s, e) in enumerate(cal, 1):
+            out.append({"promotion_id": f"PR{y}{i:02d}", "promo_name": f"{name} {y}", "promo_type": ptype,
+                        "discount_pct": pct, "category": cat, "brand": brand,
+                        "start_date": s.isoformat(), "end_date": e.isoformat()})
+    return out
+
+
+def _bump(d: date, peak: date, before: int, after: int, height: float) -> float:
+    """Smooth festive bump: builds up `before` days ahead of `peak` and fades over `after` days."""
+    dd = (peak - d).days
+    if 0 <= dd <= before:
+        return height * math.exp(-dd / (before / 3))
+    if -after <= dd < 0:
+        return height * 0.5 * math.exp(dd / (after / 2))
+    return 0.0
 
 
 def demand_multiplier(d: date) -> float:
-    days_to_diwali = (DIWALI - d).days
-    festive = 1 + 0.9 * math.exp(-max(days_to_diwali, 0) / 4) if days_to_diwali >= 0 else 1.0
-    weekend = 1.35 if d.weekday() >= 5 else 1.0
-    return festive * weekend
+    trend = 1.09 ** ((d - HISTORY_START).days / 365.25)                    # ~9% a year
+    weekend = 1.35 if d.weekday() >= 5 else (0.92 if d.weekday() in (1, 2) else 1.0)
+    season = 1.0
+    for dw in DIWALI.values():
+        season += _bump(d, dw, 14, 4, 0.9)
+    for h in HOLI.values():
+        season += _bump(d, h, 6, 2, 0.35)
+    season += _bump(d, date(d.year, 12, 31), 6, 1, 0.3) + _bump(d, date(d.year - 1, 12, 31), 6, 1, 0.3)
+    if 7 <= d.month <= 8:
+        season *= 0.92                                                       # monsoon dip
+    return trend * weekend * season
 
 
 def transactions_for(d: date, rng: random.Random, stores, customers, prods, promos) -> list[dict]:
     live = [p for p in promos if p["start_date"] <= d.isoformat() <= p["end_date"]]
-    by_store = {}
+    open_stores = [s for s in stores if s["opened_date"] <= d.isoformat()]
+    members = {}
     for c in customers:
-        by_store.setdefault(c["home_store_id"], []).append(c)
+        if c["signup_date"] <= d.isoformat():
+            members.setdefault(c["home_store_id"], []).append(c)
     rows, mult = [], demand_multiplier(d)
-    for st in stores:
-        baskets = int(rng.gauss(14, 3) * FORMATS[st["store_format"]][2] * mult)
+    summer_bev = 1.4 if 4 <= d.month <= 6 else 1.0
+    for st in open_stores:
+        ramp = min(1.0, 0.5 + (d - date.fromisoformat(st["opened_date"])).days / 360)   # new stores ramp up over a year
+        baskets = int(rng.gauss(14, 3) * FORMATS[st["store_format"]][2] * mult * ramp)
         for b in range(max(baskets, 1)):
             hour = rng.choices(range(8, 23), weights=[1, 2, 3, 4, 4, 4, 3, 3, 4, 6, 7, 7, 6, 4, 2])[0]
             ts = datetime(d.year, d.month, d.day, hour, rng.randint(0, 59), rng.randint(0, 59))
-            member = by_store.get(st["store_id"]) if rng.random() < 0.7 else None
-            cust = rng.choice(member)["customer_id"] if member else ""
+            pool = members.get(st["store_id"]) if rng.random() < 0.7 else None
+            cust = rng.choice(pool)["customer_id"] if pool else ""
             txn_id = f"T{d:%Y%m%d}{st['store_id'][2:]}{b:04d}"
-            channel = "online" if rng.random() < 0.12 else "in_store"
-            pay = rng.choices(["UPI", "Card", "Cash", "Wallet"], weights=[50, 22, 20, 8])[0]
+            channel = "online" if rng.random() < (0.08 + 0.02 * (d.year - 2023)) else "in_store"   # online share grows
+            pay = rng.choices(["UPI", "Card", "Cash", "Wallet"], weights=[45 + 3 * (d.year - 2023), 22, 25 - 3 * (d.year - 2023), 8])[0]
             for line in range(1, rng.randint(2, 7)):
                 pr = rng.choice(prods)
-                if pr["sub_category"] in FESTIVE_SUBCATS and rng.random() < 0.35 * (mult - 1):
+                if pr["sub_category"] in FESTIVE_SUBCATS and rng.random() < 0.35 * max(mult / 1.09 ** ((d - HISTORY_START).days / 365.25) - 1, 0):
                     pr = rng.choice([x for x in prods if x["sub_category"] in FESTIVE_SUBCATS])
+                if pr["category"] == "Beverages" and summer_bev > 1 and rng.random() < 0.2:
+                    pr = rng.choice([x for x in prods if x["category"] == "Beverages"])
                 promo = next((p for p in live if p["category"] == pr["category"] and p["brand"] == pr["brand"]), None)
                 qty = rng.choices([1, 2, 3, 4], weights=[60, 25, 10, 5])[0] + (1 if promo and rng.random() < 0.5 else 0)
                 if rng.random() < 0.01:
                     qty = -qty  # return
-                price = pr["mrp"]
+                price = price_on(pr["mrp"], d)
                 disc = round(abs(qty) * price * promo["discount_pct"] / 100, 2) if promo else 0.0
                 rows.append({"transaction_id": txn_id, "line_no": line, "transaction_ts": ts.isoformat(sep=" "),
                              "store_id": st["store_id"], "customer_id": cust, "sku": pr["sku"],
@@ -190,47 +249,62 @@ def to_csv_gz(rows: list[dict]) -> bytes:
     return gzip.compress(buf.getvalue().encode())
 
 
-def drop_for_day(d: date) -> dict[str, int]:
-    base = random.Random(SEED)            # master data is identical on every run
-    stores = build_stores(base)
-    customers = build_customers(base, stores)
+def files_for_day(d: date) -> dict[str, list[dict]]:
+    stores, customers, promos = master_data()
     prods = products()
-    promos = build_promotions()
-    rng = random.Random(SEED * 1000 + d.toordinal())  # each day reproducible on its own
-    day_no = (d - SIM_START).days
-
-    # customers: full extract on day 1, then the members who changed tier or signed up "today"
-    if day_no == 0:
-        cust_rows = customers
+    rng = random.Random(SEED * 1000 + d.toordinal())   # each day reproducible on its own
+    if d <= HISTORY_START:
+        cust_rows = [c for c in customers if c["signup_date"] <= d.isoformat()]   # first extract: everyone so far
     else:
-        cust_rows = [dict(c, loyalty_tier=rng.choice(["Silver", "Gold", "Platinum"])) for c in rng.sample(customers, 25)]
-        cust_rows += [c for c in customers if c["signup_date"] == d.isoformat()]
+        joined = [c for c in customers if c["signup_date"] == d.isoformat()]
+        existing = [c for c in customers if c["signup_date"] < d.isoformat()]
+        changed = [dict(c, loyalty_tier=rng.choice(["Silver", "Gold", "Platinum"])) for c in rng.sample(existing, 10)]
+        cust_rows = joined + changed
     stamp = f"{d.isoformat()} 23:30:00"
-    files = {
+    return {
         "transactions": transactions_for(d, rng, stores, customers, prods, promos),
         "customers": [dict(c, updated_at=stamp) for c in cust_rows],
-        "stores": [dict(s, updated_at=stamp) for s in stores],
-        "promotions": [dict(p, updated_at=stamp) for p in promos if p["start_date"] <= (d + timedelta(days=3)).isoformat() and p["end_date"] >= d.isoformat()],
+        "stores": [dict(s, updated_at=stamp) for s in stores if s["opened_date"] <= d.isoformat()],
+        "promotions": [dict(p, updated_at=stamp) for p in promos
+                       if p["start_date"] <= (d + timedelta(days=3)).isoformat() and p["end_date"] >= d.isoformat()],
     }
-    bucket = gcs_client().bucket(LANDING_BUCKET)
+
+
+def drop_for_day(d: date, bucket=None) -> dict[str, int]:
+    bucket = bucket or gcs_client().bucket(LANDING_BUCKET)
     counts = {}
-    for table, rows in files.items():
+    for table, rows in files_for_day(d).items():
         path = f"{table}/{d:%Y/%m/%d}/{table}_{d:%Y%m%d}.csv.gz"
-        bucket.blob(path).upload_from_string(to_csv_gz(rows), content_type="application/gzip")
-        counts[table] = len(rows)
+        header_only = not rows
+        if header_only:   # an empty extract still arrives as a file with just the header
+            rows = [{}]
+        data = to_csv_gz(rows) if not header_only else gzip.compress((",".join(HEADERS[table]) + "\n").encode())
+        bucket.blob(path).upload_from_string(data, content_type="application/gzip")
+        counts[table] = 0 if header_only else len(rows)
     return counts
+
+
+HEADERS = {
+    "customers": ["customer_id", "customer_name", "gender", "age_band", "city", "state", "home_store_id", "loyalty_tier", "signup_date", "updated_at"],
+    "promotions": ["promotion_id", "promo_name", "promo_type", "discount_pct", "category", "brand", "start_date", "end_date", "updated_at"],
+    "stores": ["store_id", "store_name", "store_format", "city", "state", "region", "opened_date", "area_sqft", "updated_at"],
+}
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--date", type=date.fromisoformat)
-    g.add_argument("--all", action="store_true")
+    ap.add_argument("--date", type=date.fromisoformat)
+    ap.add_argument("--start", type=date.fromisoformat)
+    ap.add_argument("--end", type=date.fromisoformat)
     a = ap.parse_args()
-    days = [SIM_START + timedelta(days=i) for i in range((SIM_END - SIM_START).days + 1)] if a.all else [a.date]
-    for d in days:
-        counts = drop_for_day(d)
-        print(f"landed {d} -> gs://{LANDING_BUCKET}/*/{d:%Y/%m/%d}/ " + " ".join(f"{k}={v}" for k, v in counts.items()))
+    start, end = (a.date, a.date) if a.date else (a.start or HISTORY_START, a.end or HISTORY_END)
+    days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+    bucket = gcs_client().bucket(LANDING_BUCKET)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for d, counts in zip(days, pool.map(lambda x: drop_for_day(x, bucket), days)):
+            if len(days) <= 31 or d.day == 1 or d == end:
+                print(f"landed {d} -> gs://{LANDING_BUCKET}/*/{d:%Y/%m/%d}/ " + " ".join(f"{k}={v}" for k, v in counts.items()))
+    print(f"done: {len(days)} day(s) from {start} to {end}")
 
 
 if __name__ == "__main__":

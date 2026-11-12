@@ -12,7 +12,9 @@ from __future__ import annotations
 
 from common.config import DATALAKE_BUCKET, DATALAKE_DB, MART_BUCKET, MART_DB
 
-LOAD_META = "_source_file string, _ingested_at timestamp"
+QA_DB = "qa"
+
+LOAD_META = "filename string, modified_dttm timestamp"   # landing file name (transactions_20261108.csv.gz), load time
 DAY_PART = "partitioned by (year int, month int, day int)"
 WEEK_PART = "partitioned by (year int, week int)"
 
@@ -47,20 +49,38 @@ MART_TABLES = {
         days_in_week int, baskets bigint, customers bigint, units bigint, gross_sales decimal(16,2),
         discount decimal(16,2), net_sales decimal(16,2), returns_value decimal(16,2), avg_basket_value decimal(12,2),
         promo_sales_share_pct double, sales_per_sqft decimal(12,2), prev_week_net_sales decimal(16,2),
-        wow_growth_pct double, rank_in_region int""",
+        wow_growth_pct double, prev_year_net_sales decimal(16,2), yoy_growth_pct double, rank_in_region int""",
     "category_brand_weekly": """
         category string, sub_category string, brand string, units bigint, net_sales decimal(16,2),
-        share_of_category_pct double, prev_week_net_sales decimal(16,2), wow_growth_pct double""",
+        share_of_category_pct double, prev_week_net_sales decimal(16,2), wow_growth_pct double,
+        prev_year_net_sales decimal(16,2), yoy_growth_pct double""",
     "promotion_weekly_effectiveness": """
         promotion_id string, promo_name string, promo_type string, discount_pct int, category string, brand string,
         promo_days_in_week int, promo_units bigint, promo_net_sales decimal(16,2), discount_cost decimal(16,2),
         baseline_daily_units double, promo_daily_units double, unit_uplift_pct double,
         incremental_net_sales decimal(16,2), roi double""",
+    "company_weekly_kpis": """
+        week_start date, week_end date, days_in_week int, stores_trading int, baskets bigint, customers bigint,
+        units bigint, gross_sales decimal(16,2), discount decimal(16,2), net_sales decimal(16,2),
+        avg_basket_value decimal(12,2), online_share_pct double, prev_week_net_sales decimal(16,2),
+        wow_growth_pct double, prev_year_net_sales decimal(16,2), yoy_growth_pct double""",
     "customer_tier_weekly": """
         customer_type string, loyalty_tier string, active_customers bigint, baskets bigint, units bigint,
         net_sales decimal(16,2), avg_spend_per_customer decimal(12,2), avg_baskets_per_customer double,
         share_of_sales_pct double""",
 }
+
+
+QA_TABLES = {
+    # one row per check evaluation; failures and warnings are kept for audit
+    "datalake_checks": """
+        check_name string, table_name string, check_date date, severity string, status string,
+        observed double, threshold double, detail string, checked_at timestamp""",
+    "mart_checks": """
+        check_name string, table_name string, level string, member string, iso_year int, iso_week int,
+        severity string, status string, observed double, threshold double, detail string, checked_at timestamp""",
+}
+QA_PART = "partitioned by (run_id string)"
 
 
 def ensure_hive_objects(spark) -> None:
@@ -76,6 +96,12 @@ def ensure_hive_objects(spark) -> None:
         spark.sql(f"""create external table if not exists {MART_DB}.{t} ({cols}) {WEEK_PART}
                       stored as parquet location 'gs://{MART_BUCKET}/{t}'
                       tblproperties ('layer'='mart', 'parquet.compression'='SNAPPY')""")
+    spark.sql(f"create database if not exists {QA_DB} comment 'Data quality check results for datalake and mart' "
+              f"location 'gs://{MART_BUCKET}/_qa/'")
+    for t, cols in QA_TABLES.items():
+        spark.sql(f"""create external table if not exists {QA_DB}.{t} ({cols}) {QA_PART}
+                      stored as parquet location 'gs://{MART_BUCKET}/_qa/{t}'
+                      tblproperties ('layer'='qa')""")
 
 
 def column_types(ddl_cols: str) -> dict[str, str]:

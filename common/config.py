@@ -50,7 +50,7 @@ def spark_conf() -> dict[str, str]:
     conf = {
         "spark.jars": ",".join(jars),
         "spark.driver.extraClassPath": ":".join(jars),
-        "spark.driver.memory": "2g",
+        "spark.driver.memory": os.getenv("SPARK_DRIVER_MEMORY", "4g"),
         "spark.sql.shuffle.partitions": "8",
         "spark.sql.session.timeZone": "Asia/Kolkata",
         "spark.ui.showConsoleProgress": "false",
