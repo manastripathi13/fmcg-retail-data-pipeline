@@ -116,6 +116,37 @@ airflow standalone
 
 Unpause `fmcg_daily_pipeline` and Airflow replays the 14 days, about 2 to 3 minutes each. Docker Desktop must be running.
 
+## Jupyter notebook (PySpark + gsutil)
+
+A JupyterLab environment with a ready-made kernel, **FMCG PySpark (Spark 4.0.1, GCS + Hive)**:
+
+```bash
+./scripts/notebook.sh      # JupyterLab on http://localhost:8888 (local only); registers the kernel on first run
+```
+
+When the kernel starts it runs [`notebooks/spark_init.py`](notebooks/spark_init.py), so every notebook already has:
+- **`spark`**: a SparkSession with the GCS connector and the Hive metastore (the same settings as the pipeline jobs).
+- **`F`**: `pyspark.sql.functions`.
+- **`gsutil` and `gcloud storage`** in `!` shell cells, pointed at the project's buckets.
+
+```python
+spark.table("mart.store_weekly_performance").where("year = 2026 and week = 45").show(10, 0)
+spark.sql("select category, sum(net_sales) from mart.category_brand_weekly where year = 2026 and week = 45 group by 1").show(10, 0)
+!gsutil ls -lh gs://fmcg-datalake/
+!gsutil du -sh gs://fmcg-landing gs://fmcg-datalake gs://fmcg-mart
+```
+
+[`notebooks/fmcg_lakehouse_queries.ipynb`](notebooks/fmcg_lakehouse_queries.ipynb) is a worked example, saved with its outputs:
+- a GCS configuration cell;
+- what is in each layer;
+- the raw datalake through `spark.table`;
+- business questions through `spark.sql(...).show(10, 0)`;
+- DataFrames registered as temp views, plus a matplotlib chart;
+- proof of partition pruning;
+- browsing the buckets with `gsutil`.
+
+**How `gsutil` reaches the emulator.** `scripts/setup_gcloud_emulator.sh` creates a separate gcloud configuration, `fmcg-emulator`, with the storage endpoint set to `http://localhost:4443` and no login. The notebook selects it only for its own shell commands (`CLOUDSDK_ACTIVE_CONFIG_NAME`), so your default gcloud configuration and login are unchanged. `gsutil` cannot use a custom endpoint itself, so `.gcloud/boto.cfg` makes it run through `gcloud storage`, which can. With `GCS_MODE=real`, the notebook uses your normal gcloud login and project instead.
+
 ## Query the data with SQL
 
 The `datalake` and `mart` Hive databases can be queried with SQL. Spark SQL reads the table definitions from the Hive metastore and the Parquet files from the `gs://` buckets.
@@ -253,5 +284,10 @@ airflow/dags/fmcg_daily_pipeline.py  the daily DAG
 airflow/dags/fmcg_reset.py           wipe local state
 docs/insights/                       generated weekly reports
 docs/sample_queries.sql              ready-to-run SQL over datalake and mart
+notebooks/fmcg_lakehouse_queries.ipynb  PySpark notebook: spark.table / spark.sql / gsutil, with outputs
+notebooks/spark_init.py              kernel startup: creates `spark` with GCS + Hive
+scripts/install_kernel.sh            registers the "FMCG PySpark" Jupyter kernel
+scripts/notebook.sh                  starts JupyterLab on localhost:8888
+scripts/setup_gcloud_emulator.sh     gcloud/gsutil -> GCS emulator via a separate gcloud configuration
 tests/                               unit tests (no Spark or GCS needed)
 ```
