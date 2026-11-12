@@ -27,7 +27,37 @@ It holds **three years of history (14 Nov 2023 to 13 Nov 2026)**. Four chained A
 
 ## Results from the 3-year backfill through Airflow
 
-The three-year backfill (14 Nov 2023 to 13 Nov 2026, about 4 million transaction lines) runs through all four DAGs. Its results, the weekly insights and the QA report (`docs/qa/LATEST.md`) are added to this section when the run completes.
+One manual trigger of `fmcg_1_datalake` with `{"start_date": "2023-11-14", "end_date": "2026-11-13"}` ran the whole chain on a laptop in about 1 hour 35 minutes (GCS emulator, Hive metastore on Postgres, Spark local mode).
+
+| Stage | Result |
+|---|---|
+| Landing | 1,096 days x 4 files (`.csv.gz`) |
+| `fmcg_1_datalake` | 4 tables, 1,096 daily partitions each (promotions: 405 days with rows, the rest header-only files); 3,555,180 raw transaction lines |
+| `fmcg_2_datalake_qa` | Row counts, PK uniqueness and null keys pass on every partition. Raw POS duplicates average 0.48% of lines per day (max 0.50%), so `transactions` is WARN, under the 1% FAIL limit |
+| `fmcg_3_mart` | 157 ISO weeks x 6 tables; 3,538,051 lines in `fact_sales` after de-duplication (17,129 duplicates removed); every week reconciles store, category, tier and company totals to the fact table |
+| `fmcg_4_mart_qa` | 942 weekly PK checks pass with 0 duplicates. 9 company-level WoW/YoY breaches fail the run on purpose (below); 81 region/category breaches recorded as WARN |
+
+Business view (49 stores, 4,500 loyalty members, 33 promotions, synthetic data):
+
+| Period (ISO weeks) | Net sales | Growth |
+|---|---|---|
+| 20 Nov 2023 to 17 Nov 2024 | ₹40.34 Cr | |
+| 18 Nov 2024 to 16 Nov 2025 | ₹46.97 Cr | +16.4% |
+| 17 Nov 2025 to 13 Nov 2026 | ₹55.28 Cr | +17.7% |
+
+All 9 company-level breaches sit around Diwali. The festival moves between ISO weeks each year (1 Nov 2024, 21 Oct 2025, 8 Nov 2026), so the same week last year is not a festival week:
+
+- 2026-W45 (Diwali week) is the biggest week in the data: ₹1.94 Cr net, +45.7% WoW and +107.6% YoY against an ordinary week in 2025.
+- 2025-W42, the week before Diwali 2025, is +64.7% YoY for the same reason.
+- The weeks after Diwali drop 20% to 33% WoW (2024-W45, 2025-W44, 2026-W46).
+
+This is the intended behaviour: the task goes red, an analyst confirms the festival shift, and the report keeps the explanation. A real data problem (a missing store drop, a double load) would show up in the same table.
+
+Outputs committed with this run:
+
+- [`docs/qa/LATEST.md`](docs/qa/LATEST.md): full QA report built from `qa.datalake_checks` and `qa.mart_checks`.
+- [`docs/insights/2026-W45.md`](docs/insights/2026-W45.md): weekly insights for the latest complete week (Diwali 2026).
+- [`notebooks/fmcg_lakehouse_queries.ipynb`](notebooks/fmcg_lakehouse_queries.ipynb): executed notebook with the 3-year KPIs, chart and QA queries.
 
 ## The data
 
