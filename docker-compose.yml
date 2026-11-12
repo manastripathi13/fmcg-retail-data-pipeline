@@ -1,0 +1,20 @@
+# Local stand-ins for the managed services:
+#   gcs         - Google Cloud Storage emulator (fake-gcs-server), gs:// API on :4443
+#   metastore-db - Postgres database behind the Hive metastore (Dataproc Metastore in GCP)
+services:
+  gcs:
+    image: fsouza/fake-gcs-server:1.52.2
+    command: ["-scheme", "http", "-port", "4443", "-public-host", "localhost:4443", "-external-url", "http://localhost:4443", "-backend", "filesystem", "-filesystem-root", "/storage"]
+    ports: ["4443:4443"]
+    volumes: ["gcs-data:/storage"]
+  metastore-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: metastore
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: hive
+    ports: ["5433:5432"]
+    volumes: ["metastore-data:/var/lib/postgresql/data"]
+volumes:
+  gcs-data:
+  metastore-data:
