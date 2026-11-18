@@ -8,6 +8,8 @@ It holds **three years of history (14 Nov 2023 to 13 Nov 2026)**. Four chained A
 
 **Stack:** Python · PySpark · Google Cloud Storage · Hive metastore · Apache Airflow · JupyterLab
 
+**System design:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the architecture diagrams and a step-by-step walkthrough of the design, decisions and failure handling.
+
 ```
  retailer systems                 GCS buckets                                    Hive metastore (Postgres)
  ─────────────────                ─────────────────────────────────────────      ─────────────────────────
